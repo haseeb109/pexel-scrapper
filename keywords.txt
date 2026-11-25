@@ -1,0 +1,4 @@
+# one search per line — lines starting with # are ignored
+ocean waves
+city night traffic
+courtroom
