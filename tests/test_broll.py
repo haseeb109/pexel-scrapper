@@ -16,6 +16,7 @@ BASE = f"http://127.0.0.1:{PORT}"
 os.environ["DEEPSEEK_BASE_URL"] = BASE
 os.environ["PEXELS_SITE"] = BASE
 os.environ["BROLL_OUT"] = tempfile.mkdtemp()
+os.environ["DEEPSEEK_BACKOFF"] = "0"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import script_broll as sb  # noqa: E402
@@ -45,7 +46,21 @@ def main():
         print("keyword queries:", kq)
         assert kq and all(isinstance(q, str) and q for q in kq)
 
+        # --- abbreviations don't split sentences
+        assert sb.split_script("Mr. Smith met Dr. Jones in the U.S. court today.") == \
+            ["Mr. Smith met Dr. Jones in the U.S. court today."]
+
+        # --- one failing DeepSeek batch falls back to keywords for that batch only
+        logs = []
+        sents4 = ["The courtroom was full today.", "Rain fell on the window glass.",
+                  "FAILBATCH the judge said nothing.", "FAILBATCH the lawyer left early."]
+        plans = sb.deepseek_queries(sents4, "sk-test", batch=2, log=logs.append)
+        print("per-batch sources:", [p["source"] for p in plans])
+        assert [p["source"] for p in plans] == ["deepseek", "deepseek", "keywords", "keywords"]
+        assert any("failed for sentences 3-4" in m for m in logs)
+
         # --- full flow through the web UI
+        calls_before = DS_CALLS["n"]
         client = webapp.app.test_client()
         assert client.get("/").status_code == 200
         r = client.post("/start", json={"script": SCRIPT, "name": "Docket Ep 1", "aspect": "16:9",
@@ -61,7 +76,7 @@ def main():
         print("\n".join(s["log"]))
         assert s["done"] and not s["error"], s["error"]
         res = s["result"]
-        assert DS_CALLS["n"] == 1 and DS_CALLS["bodies"][0]["model"] == "deepseek-flash"
+        assert DS_CALLS["n"] == calls_before + 1 and DS_CALLS["bodies"][-1]["model"] == "deepseek-flash"
         assert res["sentences"] == 4 and res["clips"] == 8 and not res["missing"], res
 
         verdict = next(x for x in s["sentences"] if x["i"] == 3)
@@ -78,7 +93,7 @@ def main():
 
         z = client.get(f"/download/{job}")
         assert z.status_code == 200
-        zf = zipfile.ZipFile(Path(res["zip"]))
+        zf = zipfile.ZipFile(Path(res["folder"]).with_suffix(".zip"))
         names = zf.namelist()
         assert any(n.endswith("storyboard.html") for n in names) and sum(n.endswith(".mp4") for n in names) == 8
         assert client.get(f"/storyboard/{job}").status_code == 200

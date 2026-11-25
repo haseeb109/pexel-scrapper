@@ -29,6 +29,12 @@ from urllib.parse import quote
 
 import requests
 
+for _stream in (sys.stdout, sys.stderr):          # don't crash on ✓ ✗ in old Windows consoles
+    try:
+        _stream.reconfigure(errors="replace")      # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001 — None under pythonw, or not reconfigurable
+        pass
+
 SITE = "https://www.pexels.com"
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -216,7 +222,11 @@ class PexelsSite:
         m = NEXT_DATA_RE.search(html)
         if not m:
             raise RuntimeError("Page layout changed: __NEXT_DATA__ not found")
-        pp = json.loads(m.group(1)).get("props", {}).get("pageProps", {})
+        return PexelsSite.parse_next_data(m.group(1))
+
+    @staticmethod
+    def parse_next_data(raw_json: str) -> dict:
+        pp = json.loads(raw_json).get("props", {}).get("pageProps", {})
         init = pp.get("initialData") or {}
         pag = init.get("pagination") or {}
         meta = init.get("meta") or {}
@@ -240,7 +250,7 @@ class Criteria:
     min_fps: float = 0
     max_fps: float = 0
     aspect: Optional[float] = None
-    aspect_tol: float = 0.03
+    aspect_tol: float = 0.12
     resolution: int = 1080
     strict_resolution: bool = False
     target_duration: int = 0
@@ -267,6 +277,14 @@ def choose_file(v: Video, c: Criteria) -> Optional[VideoFile]:
     return max((f for f in good if f.short_side == hi), key=lambda f: f.fps)
 
 
+def has_word(text: str, word: str) -> bool:
+    """Whole-word / whole-phrase match, so 'man' doesn't hit 'woman' or 'Manhattan'."""
+    word = word.strip().lower()
+    if not word:
+        return False
+    return re.search(r"(?<![a-z0-9])" + re.escape(word) + r"s?(?![a-z0-9])", text.lower()) is not None
+
+
 def passes(v: Video, c: Criteria) -> tuple[bool, str]:
     if c.min_duration and v.duration < c.min_duration:   return False, "too short"
     if c.max_duration and v.duration > c.max_duration:   return False, "too long"
@@ -277,9 +295,9 @@ def passes(v: Video, c: Criteria) -> tuple[bool, str]:
     if c.aspect and abs(v.aspect_ratio - c.aspect) > c.aspect_tol:
         return False, "aspect"
     hay = " ".join([v.title, v.description, *v.tags]).lower()
-    if c.require_tags and not all(t.lower() in hay for t in c.require_tags):
+    if c.require_tags and not all(has_word(hay, t) for t in c.require_tags):
         return False, "missing word"
-    if any(w.lower() in hay for w in c.exclude_words):    return False, "excluded word"
+    if any(has_word(hay, w) for w in c.exclude_words):    return False, "excluded word"
     if {v.author_name.lower(), v.author_username.lower()} & {x.lower() for x in c.exclude_authors}:
         return False, "excluded author"
     v.chosen_file = choose_file(v, c)
@@ -472,7 +490,8 @@ def build_parser():
     g.add_argument("--min-fps", type=float, default=0)
     g.add_argument("--max-fps", type=float, default=0)
     g.add_argument("--aspect", help="16:9, 9:16, 1:1, 2.39 …")
-    g.add_argument("--aspect-tol", type=float, default=0.03)
+    g.add_argument("--aspect-tol", type=float, default=0.12,
+                   help="0.12 lets 4096x2160 (DCI 4K) count as 16:9")
     g.add_argument("--require", nargs="+", default=[], metavar="WORD")
     g.add_argument("--exclude", nargs="+", default=[], metavar="WORD")
     g.add_argument("--exclude-author", nargs="+", default=[], metavar="NAME")

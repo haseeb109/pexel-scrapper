@@ -16,21 +16,32 @@ PORT = 8768
 SHA = "abc1234def5678900000000000000000deadbeef"
 
 
+def blob_sha(data: bytes) -> str:
+    import hashlib
+    data = data.replace(b"\r\n", b"\n")
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+TREE = []
+
+
 def make_zip():
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
         for p in APP.rglob("*"):
-            if p.is_file() and ".venv" not in p.parts and "__pycache__" not in p.parts:
+            if p.is_file() and not ({".venv", "__pycache__", ".git"} & set(p.parts)):
                 rel = p.relative_to(APP).as_posix()
                 data = p.read_bytes()
                 if rel == "README.md":
                     data += b"\nUPDATED-MARKER\n"
                 if rel == "requirements.txt":
                     continue                                   # unchanged reqs → no pip run
+                TREE.append({"path": rel, "type": "blob", "sha": blob_sha(data)})
                 info = zipfile.ZipInfo(f"pexel-scrapper-main/{rel}")
                 info.external_attr = (0o755 if rel.endswith(".command") else 0o644) << 16
                 z.writestr(info, data)
         z.writestr("pexel-scrapper-main/new_feature.py", "print('new')\n")
+        TREE.append({"path": "new_feature.py", "type": "blob", "sha": blob_sha(b"print('new')\n")})
         z.writestr("pexel-scrapper-main/broll_projects/should_not_overwrite.txt", "x")
     return buf.getvalue()
 
@@ -42,7 +53,10 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
     def do_GET(self):
-        if self.path.startswith("/repos/"):
+        if "/git/trees/" in self.path:
+            body = json.dumps({"sha": SHA, "tree": TREE}).encode()
+            ctype = "application/json"
+        elif self.path.startswith("/repos/"):
             body = json.dumps({"sha": SHA, "commit": {"committer": {"date": "2026-11-25T02:00:00Z"},
                                                       "message": "Add new feature\n\ndetails"}}).encode()
             ctype = "application/json"
@@ -77,6 +91,18 @@ def main():
     assert not (tmp / "broll_projects" / "should_not_overwrite.txt").exists(), "user folders untouched"
     assert os.access(tmp / "Start (Mac).command", os.X_OK), "launcher stays executable"
     assert json.loads((tmp / ".installed_version.json").read_text())["sha"] == SHA
+    # a fresh "Download ZIP" install that already matches GitHub must NOT say "update available"
+    (tmp / ".installed_version.json").unlink()
+    r2 = subprocess.run([sys.executable, "-c", "import updater, json; print(json.dumps(updater.check()))"],
+                        cwd=tmp, env=env, capture_output=True, text=True)
+    print("fresh install check:", r2.stdout.strip()[:80], r2.stderr[-300:])
+    assert json.loads(r2.stdout)["available"] is False, "matching files → up to date, no false alarm"
+    # and a changed local file → update offered again
+    (tmp / "gui.py").write_text((tmp / "gui.py").read_text() + "\n# local edit\n")
+    (tmp / ".installed_version.json").unlink()
+    r3 = subprocess.run([sys.executable, "-c", "import updater, json; print(json.dumps(updater.check()))"],
+                        cwd=tmp, env=env, capture_output=True, text=True)
+    assert json.loads(r3.stdout)["available"] is True
     print("ALL UPDATE TESTS PASSED")
     srv.shutdown()
 

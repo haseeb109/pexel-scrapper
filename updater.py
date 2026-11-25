@@ -69,11 +69,45 @@ def latest() -> dict:
             "message": d["commit"]["message"].splitlines()[0]}
 
 
+def _git_blob_sha(path: Path) -> str:
+    data = path.read_bytes().replace(b"\r\n", b"\n")       # repo stores LF; .bat is checked out as CRLF
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _files_match(commit_sha: str) -> bool:
+    """True if every file of that GitHub commit is already here with identical content."""
+    r = requests.get(f"{API}/repos/{REPO}/git/trees/{commit_sha}", params={"recursive": "1"}, timeout=15,
+                     headers={"Accept": "application/vnd.github+json", "User-Agent": "pexels-broll-updater"})
+    r.raise_for_status()
+    blobs = [i for i in r.json().get("tree", []) if i.get("type") == "blob"]
+    if not blobs:
+        return False
+    for item in blobs:
+        local = APP_DIR / item["path"]
+        if not local.is_file():
+            return False
+        try:
+            if _git_blob_sha(local) != item["sha"]:
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def check() -> dict:
     """{'available': bool, 'current': sha, 'latest': {...}}"""
     cur = installed()
     new = latest()
-    return {"available": cur.get("sha") != new["sha"], "current": cur.get("sha", ""), "latest": new}
+    available = cur.get("sha") != new["sha"]
+    if available and cur.get("via") != "git":
+        # fresh "Download ZIP" installs have no version stamp yet: compare the actual files
+        try:
+            if _files_match(new["sha"]):
+                STAMP.write_text(json.dumps({"sha": new["sha"], "date": new["date"], "via": "zip"}))
+                cur, available = {"sha": new["sha"]}, False
+        except Exception:  # noqa: BLE001 — fall back to "update available"
+            pass
+    return {"available": available, "current": cur.get("sha", ""), "latest": new}
 
 
 def _req_hash() -> str:
@@ -124,6 +158,10 @@ def update(log: Callable[[str], None] = print) -> dict:
         STAMP.write_text(json.dumps({"sha": new["sha"], "date": new["date"], "via": "zip"}))
     if _req_hash() != before:
         _pip_install(log)
+        try:                                             # keep the Mac launcher's cache in sync
+            (APP_DIR / ".venv" / ".req_hash").write_text(hashlib.sha1((APP_DIR / "requirements.txt").read_bytes()).hexdigest())
+        except OSError:
+            pass
     log(f"✓ Now on {new['sha'][:7]} — {new['message']}")
     return new
 

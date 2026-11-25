@@ -71,11 +71,20 @@ class BrowserSite:
         attempts = ([dict(executable_path=exe)] if exe else []) + [dict(channel="chrome"), {}]
         last = None
         for extra in attempts:
-            try:
-                self._ctx = self._pw.chromium.launch_persistent_context(**opts, **extra)
+            for retry in range(2):
+                try:
+                    self._ctx = self._pw.chromium.launch_persistent_context(**opts, **extra)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    last = e
+                    msg = str(e).lower()
+                    if retry == 0 and ("singleton" in msg or "already in use" in msg or "profile" in msg):
+                        # a previous run crashed and left Chrome's profile lock behind
+                        self._clear_profile_lock()
+                        continue
+                    break
+            if self._ctx is not None:
                 break
-            except Exception as e:  # noqa: BLE001
-                last = e
         if self._ctx is None:
             # Neither Google Chrome nor Playwright's Chromium is available → fetch Chromium once
             self.log("Google Chrome not found — downloading a browser for the app (one time, ~150 MB)…")
@@ -87,6 +96,16 @@ class BrowserSite:
             self._ctx = self._pw.chromium.launch_persistent_context(**opts)
         self._page = self._ctx.pages[0] if self._ctx.pages else self._ctx.new_page()
         self.log("Chrome window opened for Pexels (keep it open while the app works).")
+
+    @staticmethod
+    def _clear_profile_lock():
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            p = PROFILE_DIR / name
+            try:
+                if p.exists() or p.is_symlink():
+                    p.unlink()
+            except OSError:
+                pass
 
     def close(self):
         for obj, meth in ((self._ctx, "close"), (self._pw, "stop")):
@@ -163,7 +182,7 @@ class BrowserSite:
                     if raw:
                         break
             if raw:
-                return ps.PexelsSite._parse(f'<script id="__NEXT_DATA__">{raw}</script>')
+                return ps.PexelsSite.parse_next_data(raw)
             if self._on_check():
                 raise ps.Blocked("Pexels check was not completed in the Chrome window")
         raise RuntimeError(f"Could not read Pexels results for '{keyword}' (page layout may have changed)")

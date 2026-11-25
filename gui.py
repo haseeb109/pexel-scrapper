@@ -6,12 +6,16 @@ Double-click "Start (Mac).command" or "Start (Windows).bat" — or run:  python 
 """
 from __future__ import annotations
 
+import warnings
+warnings.filterwarnings("ignore", message=".*OpenSSL.*")      # Apple's Python 3.9 + urllib3 v2 notice
+
 import json
 import os
 import platform
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -169,7 +173,7 @@ class App(tk.Tk):
                         command=lambda: self.key_entry.config(show="" if self.show_var.get() else "•"))\
             .grid(row=0, column=1, padx=6)
         ttk.Button(ds, text="Test key", command=self._test_key).grid(row=0, column=2)
-        self.remember_var = tk.BooleanVar(value=bool(self.cfg.get("deepseek_key")) or True)
+        self.remember_var = tk.BooleanVar(value=self.cfg.get("remember_key", True))
         ttk.Checkbutton(ds, text="Remember on this computer", variable=self.remember_var)\
             .grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.key_status = ttk.Label(ds, text="Get a key at platform.deepseek.com → API keys. "
@@ -217,7 +221,7 @@ class App(tk.Tk):
         self.dl_btn = ttk.Button(self.actions, text="⬇  Download folder (ZIP)", style="Big.TButton",
                                  command=self._save_zip, state="disabled")
         self.dl_btn.pack(side="left")
-        self.open_btn = ttk.Button(self.actions, text="📂  Open folder", style="Big.TButton",
+        self.open_btn = ttk.Button(self.actions, text="Open folder", style="Big.TButton",
                                    command=self._open_folder, state="disabled")
         self.open_btn.pack(side="left", padx=8)
         self.board_btn = ttk.Button(self.actions, text="Storyboard", style="Big.TButton",
@@ -287,6 +291,7 @@ class App(tk.Tk):
         self.cfg.update(out_dir=self.out_var.get(), format=self.fmt_var.get(), quality=self.q_var.get(),
                         clips=int(self.clips_var.get() or 1), exclude=self.excl_var.get(),
                         use_chrome=bool(self.chrome_var.get()))
+        self.cfg["remember_key"] = bool(self.remember_var.get())
         if self.remember_var.get() and self.key_var.get().strip():
             self.cfg["deepseek_key"] = self.key_var.get().strip()
         elif not self.remember_var.get():
@@ -322,6 +327,7 @@ class App(tk.Tk):
                          use_browser=bool(self.chrome_var.get()))
         key = self.key_var.get().strip()
         name = self.name_var.get().strip() or time.strftime("project-%Y%m%d-%H%M")
+        self._job_folder = out_dir / sb.slug(name, 50)
 
         self.result = None
         self.rows.clear()
@@ -432,8 +438,8 @@ class App(tk.Tk):
     def _on_stopped(self, _):
         self._finish()
         self.summary.config(text="Stopped. Clips already downloaded are in the project's clips folder.")
-        folder = Path(self.out_var.get()).expanduser() / ps.safe_name(self.name_var.get(), 50)
-        if folder.exists():
+        folder = getattr(self, "_job_folder", None)
+        if folder and folder.exists():
             self.result = {"folder": str(folder)}
             self.open_btn.config(state="normal")
 
@@ -510,17 +516,36 @@ class App(tk.Tk):
 
     # -------------------------------------------------------------- outputs
     def _save_zip(self):
-        if not self.result or not self.result.get("zip"):
+        if not self.result or not self.result.get("folder"):
             return
-        src = Path(self.result["zip"])
-        dest = filedialog.asksaveasfilename(initialfile=src.name, defaultextension=".zip",
+        folder = Path(self.result["folder"])
+        dest = filedialog.asksaveasfilename(initialfile=folder.name + ".zip", defaultextension=".zip",
                                             initialdir=str(Path.home() / "Downloads"),
                                             filetypes=[("ZIP", "*.zip")])
-        if dest:
-            shutil.copyfile(src, dest)
-            self._log(f"Saved ZIP → {dest}")
-            if messagebox.askyesno(APP_NAME, "ZIP saved. Show it in the folder?"):
-                open_path(str(Path(dest).parent))
+        if not dest:
+            return
+        self.dl_btn.config(state="disabled", text="Zipping…")
+        def run():
+            try:
+                out = sb.make_zip(folder, dest, progress=lambda n, t: self.q.put(("zip_progress", (n, t))))
+                self.q.put(("zip_done", out))
+            except Exception as e:  # noqa: BLE001
+                self.q.put(("zip_failed", str(e)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_zip_progress(self, data):
+        n, t = data
+        self.dl_btn.config(text=f"Zipping… {n}/{t}")
+
+    def _on_zip_done(self, path):
+        self.dl_btn.config(state="normal", text="⬇  Download folder (ZIP)")
+        self._log(f"Saved ZIP → {path}")
+        if messagebox.askyesno(APP_NAME, "ZIP saved. Show it in the folder?"):
+            open_path(str(Path(path).parent))
+
+    def _on_zip_failed(self, msg):
+        self.dl_btn.config(state="normal", text="⬇  Download folder (ZIP)")
+        messagebox.showerror(APP_NAME, f"Couldn't create the ZIP:\n{msg}")
 
     def _open_folder(self):
         if self.result and self.result.get("folder"):
@@ -552,5 +577,34 @@ class App(tk.Tk):
         self.destroy()
 
 
+ERROR_LOG = Path.home() / "pexels_broll_error.log"
+
+
+def _log_crash(text: str):
+    try:
+        with open(ERROR_LOG, "a", encoding="utf-8") as fh:
+            fh.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n{text}\n")
+    except OSError:
+        pass
+
+
+def main():
+    import traceback
+    if sys.stderr is None:                      # Windows pythonw: keep errors somewhere readable
+        sys.stderr = open(ERROR_LOG, "a", encoding="utf-8")
+    try:
+        app = App()
+    except Exception:  # noqa: BLE001
+        _log_crash(traceback.format_exc())
+        raise
+
+    def report(exc, val, tb):
+        text = "".join(traceback.format_exception(exc, val, tb))
+        _log_crash(text)
+        messagebox.showerror(APP_NAME, f"Something went wrong:\n{val}\n\nDetails were saved to {ERROR_LOG}")
+    app.report_callback_exception = report
+    app.mainloop()
+
+
 if __name__ == "__main__":
-    App().mainloop()
+    main()

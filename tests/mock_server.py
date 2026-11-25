@@ -82,6 +82,8 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(resp), "application/json")
         assert body["response_format"] == {"type": "json_object"}
         user = body["messages"][1]["content"].split("SENTENCES:\n")[1]
+        if "FAILBATCH" in user:
+            return self._send(500, "server error", "text/plain")
         items = []
         for line in user.splitlines():
             n, text = line.split(". ", 1)

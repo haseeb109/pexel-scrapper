@@ -42,6 +42,17 @@ def main():
         clips = sorted(Path(res["folder"], "clips").glob("*.mp4"))
         assert [c.name[:4] for c in clips] == ["001a", "002a"] and all(c.stat().st_size == 20000 for c in clips)
         assert not list(Path(res["folder"], "clips").glob("*.part")), "no leftover partial files"
+        # a crashed earlier run leaves Chrome's profile lock behind → app must still start
+        prof = Path(os.environ["PEXELS_CHROME_PROFILE"])
+        lock = prof / "SingletonLock"
+        if lock.exists() or lock.is_symlink():
+            lock.unlink()
+        os.symlink("some-other-mac-99999", lock)
+        from browser_site import BrowserSite
+        site = BrowserSite(BASE, delay=0, log=print)
+        data = site.search_page("courtroom")
+        site.close()
+        assert data["videos"], "launch should recover from a stale profile lock"
         print("ALL CHROME TESTS PASSED")
     finally:
         srv.shutdown()

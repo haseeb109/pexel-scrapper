@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import functools
 import csv
 import html
 import json
@@ -33,13 +34,22 @@ import pexels_scraper as ps
 
 DEEPSEEK_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com") + "/chat/completions"
 DEEPSEEK_MODELS = [os.getenv("DEEPSEEK_MODEL", "deepseek-flash"), "deepseek-chat"]
-WORDS_PER_SEC = 2.5          # ~150 wpm narration
+WORDS_PER_SEC = 2.5
+BACKOFF = float(os.getenv("DEEPSEEK_BACKOFF", 5))          # seconds; tests set 0          # ~150 wpm narration
 
 
 # --------------------------------------------------------------------------- #
 # 1. Split script into sentences
 # --------------------------------------------------------------------------- #
+ABBREV = re.compile(r"\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|Lt|Sgt|Capt|Col|Gen|Gov|Sen|Rep|Rev|Hon|"
+                    r"vs|etc|approx|No|Vol|Inc|Ltd|Co|Corp|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|"
+                    r"Nov|Dec)\.(?=\s)", re.I)
+INITIALS = re.compile(r"\b((?:[A-Z]\.){2,})(?=\s+[a-z])")      # U.S. court, D.C. police
+
+
 def split_script(text: str, min_words: int = 4) -> list[str]:
+    text = ABBREV.sub(lambda m: m.group(1) + "\u2024", text)       # protect "Mr." etc. from splitting
+    text = INITIALS.sub(lambda m: m.group(1).replace(".", "\u2024"), text)
     text = re.sub(r"\[[^\]]*\]|\([^)]*(music|sfx|pause|intro|outro)[^)]*\)", " ", text, flags=re.I)  # drop [cues]
     parts = []
     for para in re.split(r"\n\s*\n|\n", text):
@@ -55,7 +65,7 @@ def split_script(text: str, min_words: int = 4) -> list[str]:
             merged.append(s)
     if len(merged) > 1 and len(merged[0].split()) < min_words:
         merged[1] = merged[0] + " " + merged[1]; merged.pop(0)
-    return merged
+    return [m.replace("\u2024", ".") for m in merged]
 
 
 # --------------------------------------------------------------------------- #
@@ -80,51 +90,48 @@ class DeepSeekError(RuntimeError):
     pass
 
 
+class DeepSeekFatal(DeepSeekError):
+    """Key rejected / no balance — no point trying more batches."""
+
+
 def deepseek_queries(sentences: list[str], api_key: str, context: str = "",
                      batch: int = 25, log: Callable[[str], None] = print) -> list[dict]:
+    """Ask DeepSeek for visual queries, 25 sentences per call.
+    A failed batch falls back to keyword matching for just that batch; a rejected key or
+    empty balance on the first batch raises DeepSeekFatal so the caller can fall back for all."""
     out: list[dict] = []
     s = requests.Session()
     s.headers.update({"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
-    models = list(dict.fromkeys(DEEPSEEK_MODELS))
+    state = {"models": list(dict.fromkeys(DEEPSEEK_MODELS)), "thinking": True}
+    fatal = ""
     for start in range(0, len(sentences), batch):
         chunk = sentences[start:start + batch]
-        numbered = "\n".join(f"{start + k + 1}. {t}" for k, t in enumerate(chunk))
-        user = f"CONTEXT (start of script):\n{context[:1500]}\n\nSENTENCES:\n{numbered}"
-        body = {"messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                             {"role": "user", "content": user}],
-                "response_format": {"type": "json_object"}, "temperature": 0.4, "max_tokens": 4000,
-                "thinking": {"type": "disabled"}}
         data, last_err = None, ""
-        for attempt in range(4):
-            body["model"] = models[0]
+        if not fatal:
+            numbered = "\n".join(f"{start + k + 1}. {t}" for k, t in enumerate(chunk))
+            user = f"CONTEXT (start of script):\n{context[:1500]}\n\nSENTENCES:\n{numbered}"
+            msgs = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
             try:
-                r = s.post(DEEPSEEK_URL, json=body, timeout=120)
-            except requests.RequestException as e:
-                last_err = str(e); time.sleep(2 * (attempt + 1)); continue
-            if r.status_code == 401:
-                raise DeepSeekError("DeepSeek rejected the API key (401)")
-            if r.status_code == 402:
-                raise DeepSeekError("DeepSeek account has no balance (402)")
-            if r.status_code == 400:
-                txt = r.text.lower()
-                if "thinking" in txt and "thinking" in body:
-                    body.pop("thinking"); continue                     # older API: drop param
-                if "model" in txt and len(models) > 1:
-                    log(f"  model {models[0]} not available, trying {models[1]}")
-                    models.pop(0); continue
-            if r.status_code in (429, 500, 502, 503):
-                time.sleep(5 * (attempt + 1)); last_err = f"HTTP {r.status_code}"; continue
-            if not r.ok:
-                raise DeepSeekError(f"DeepSeek HTTP {r.status_code}: {r.text[:200]}")
-            try:
-                content = r.json()["choices"][0]["message"]["content"]
-                data = json.loads(content)
-                break
-            except Exception as e:  # noqa: BLE001 — empty/garbled JSON, retry
-                last_err = f"bad JSON: {e}"
+                data, last_err = _deepseek_call(s, msgs, state, log)
+            except DeepSeekFatal as e:
+                if not out:
+                    raise
+                fatal = str(e)
+                log(f"  ⚠ {e} — remaining sentences use keyword matching")
+            except DeepSeekError as e:
+                last_err = str(e)
         if data is None:
-            raise DeepSeekError(f"DeepSeek failed for sentences {start + 1}-{start + len(chunk)}: {last_err}")
-        by_i = {int(it.get("i", 0)): it for it in data.get("items", []) if isinstance(it, dict)}
+            if not fatal:
+                log(f"  ⚠ DeepSeek failed for sentences {start + 1}-{start + len(chunk)} ({last_err}) "
+                    "— using keyword matching for these")
+            out += [{"queries": keyword_queries(t, context), "avoid": [], "source": "keywords"} for t in chunk]
+            continue
+        by_i = {}
+        for it in data.get("items", []) if isinstance(data, dict) else []:
+            try:
+                by_i[int(it.get("i", 0))] = it
+            except (TypeError, ValueError, AttributeError):
+                pass
         for k, sent in enumerate(chunk):
             it = by_i.get(start + k + 1) or {}
             qs = [q.strip() for q in it.get("queries", []) if isinstance(q, str) and q.strip()][:4]
@@ -133,6 +140,40 @@ def deepseek_queries(sentences: list[str], api_key: str, context: str = "",
                         "source": "deepseek" if qs else "keywords"})
         log(f"  DeepSeek: queries ready for {min(start + batch, len(sentences))}/{len(sentences)} sentences")
     return out
+
+
+def _deepseek_call(s: requests.Session, msgs: list, state: dict, log) -> tuple:
+    """One batch with retries. Returns (parsed_json | None, last_error)."""
+    last_err = ""
+    for attempt in range(5):
+        body = {"model": state["models"][0], "messages": msgs, "temperature": 0.4, "max_tokens": 4000,
+                "response_format": {"type": "json_object"}}
+        if state["thinking"]:
+            body["thinking"] = {"type": "disabled"}
+        try:
+            r = s.post(DEEPSEEK_URL, json=body, timeout=120)
+        except requests.RequestException as e:
+            last_err = str(e); time.sleep(BACKOFF * 0.4 * (attempt + 1)); continue
+        if r.status_code == 401:
+            raise DeepSeekFatal("DeepSeek rejected the API key (401)")
+        if r.status_code == 402:
+            raise DeepSeekFatal("DeepSeek account has no balance (402)")
+        if r.status_code in (400, 404, 422):
+            txt = r.text.lower()
+            if "thinking" in txt and state["thinking"]:
+                state["thinking"] = False; continue                 # API without that parameter
+            if "model" in txt and len(state["models"]) > 1:
+                log(f"  model {state['models'][0]} not available, using {state['models'][1]}")
+                state["models"].pop(0); continue
+        if r.status_code in (429, 500, 502, 503, 504):
+            last_err = f"HTTP {r.status_code}"; time.sleep(BACKOFF * (attempt + 1)); continue
+        if not r.ok:
+            raise DeepSeekError(f"HTTP {r.status_code}: {r.text[:200]}")
+        try:
+            return json.loads(r.json()["choices"][0]["message"]["content"]), ""
+        except Exception as e:  # noqa: BLE001 — empty/garbled JSON → retry
+            last_err = f"bad JSON: {e}"
+    return None, last_err
 
 
 STOP = set("""a an the and or but if then so of to in on at by for with from into onto over under
@@ -147,24 +188,31 @@ made know knew think thought see saw look looked want wanted take took give gave
 okay well right left way time day days year years people person man woman men women""".split())
 
 
+@functools.lru_cache(maxsize=8)
+def _topic_word(context: str) -> str:
+    """Most frequent content word of the whole script — a safe broad fallback query."""
+    words = [w.lower() for w in re.findall(r"[A-Za-z]{5,}", context) if w.lower() not in STOP]
+    return max(set(words), key=words.count) if words else ""
+
+
 def keyword_queries(sentence: str, context: str = "") -> list[str]:
     """Offline fallback: pick the most 'visual' content words."""
     words = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'-]+", sentence)]
-    content = [w.strip("'") for w in words if w not in STOP and len(w) > 3]
+    content = [w.strip("'") for w in words
+               if w not in STOP and len(w) > 3 and not w.endswith("ly")]
     seen, uniq = set(), []
     for w in content:
         if w not in seen:
             seen.add(w); uniq.append(w)
-    uniq.sort(key=len, reverse=True)
+    # nouns make better stock searches than verbs: push -ed / -ing words back
+    uniq.sort(key=lambda w: (w.endswith(("ed", "ing")), -len(w)))
     top = uniq[:3]
     qs = []
     if len(top) >= 2: qs.append(f"{top[0]} {top[1]}")
     qs += top[:2]
-    if context:
-        ctx_words = [w.lower() for w in re.findall(r"[A-Za-z]{5,}", context) if w.lower() not in STOP]
-        if ctx_words:
-            common = max(set(ctx_words), key=ctx_words.count)
-            qs.append(common)
+    common = _topic_word(context) if context else ""
+    if common:
+        qs.append(common)
     return list(dict.fromkeys(qs))[:4] or ["cinematic b-roll"]
 
 
@@ -222,7 +270,7 @@ class FootageFinder:
         need = max(self.st.min_clip_seconds, math.ceil(sr.seconds / self.st.clips_per_sentence))
         # pass 1: clip long enough to cover the line; pass 2: any length
         for min_dur in (need, 0):
-            c = ps.Criteria(min_duration=min_dur, aspect=self.st.aspect, aspect_tol=0.05,
+            c = ps.Criteria(min_duration=min_dur, aspect=self.st.aspect, aspect_tol=0.15,
                             resolution=self.st.resolution, target_duration=max(need, 8),
                             exclude_words=self.st.exclude + sr.avoid)
             for q in sr.queries:
@@ -403,13 +451,31 @@ def _search_and_download(results, site, settings, proj, clips_dir, log, on_updat
         except OSError:
             pass
     write_storyboard(proj, results)
-    check_stop()
-    zip_path = shutil.make_archive(str(proj), "zip", root_dir=proj.parent, base_dir=proj.name)
     ok = sum(1 for _, v, _ in jobs if v.status in ("downloaded", "exists"))
     missing = [sr.index for sr in results if not sr.clips]
     log(f"Done: {ok}/{len(jobs)} clips downloaded, {len(missing)} sentences without footage → {proj}")
-    return {"folder": str(proj), "zip": zip_path, "sentences": len(results), "clips": ok,
+    return {"folder": str(proj), "sentences": len(results), "clips": ok,
             "missing": missing, "blocked": blocked}
+
+
+def make_zip(folder: str | Path, dest: str | Path | None = None,
+             progress: Optional[Callable[[int, int], None]] = None) -> str:
+    """Zip a project folder. Videos are stored without recompression (they're already compressed),
+    so this is about as fast as copying the files."""
+    import zipfile
+    folder = Path(folder)
+    dest = Path(dest) if dest else folder.with_suffix(".zip")
+    files = [p for p in sorted(folder.rglob("*")) if p.is_file() and not p.name.endswith(".part")]
+    tmp = dest.with_name(dest.name + ".tmp")
+    with zipfile.ZipFile(tmp, "w", allowZip64=True) as z:
+        for n, p in enumerate(files, 1):
+            comp = zipfile.ZIP_STORED if p.suffix.lower() in (".mp4", ".mov", ".jpg", ".png", ".zip") \
+                else zipfile.ZIP_DEFLATED
+            z.write(p, Path(folder.name) / p.relative_to(folder), compress_type=comp)
+            if progress:
+                progress(n, len(files))
+    os.replace(tmp, dest)
+    return str(dest)
 
 
 def write_storyboard(proj: Path, results: list[SentenceResult]):

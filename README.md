@@ -27,7 +27,8 @@ Click **⟳ Check for updates** at the top right of the app.
 |---|---|
 | Double-click **`Start (Mac).command`** | Double-click **`Start (Windows).bat`** |
 
-**First run:** the launcher sets itself up (about 30 seconds) and opens the **Pexels B-roll Finder** window.
+**First run:** the launcher sets itself up (about a minute) and opens the **Pexels B-roll Finder** window. Later launches open straight away. Packages are only reinstalled when `requirements.txt` changes.
+- **Mac:** the launcher prefers python.org / Homebrew Python over Apple's old built-in Python 3.9. If you install a newer Python later, it rebuilds its environment by itself.
 
 **Needs Python 3** with its window toolkit:
 - Mac: the installer from python.org includes it. If you use Homebrew Python, run `brew install python-tk`.
@@ -49,7 +50,7 @@ In the window:
 4. Paste the script, or use **Load .txt…**. The counter under the box shows sentences, words and estimated narration time.
 5. Press **▶ Find footage**. Every sentence shows its search query, clip count and status live. **■ Stop** cancels at any time.
 6. When it's done, use one of the buttons:
-   - **⬇ Download folder (ZIP)** (asks where to save)
+   - **⬇ Download folder (ZIP)**: asks where to save, then builds the ZIP there. Videos are stored without recompression, so it's about as fast as copying.
    - **📂 Open folder**
    - **Storyboard**
 
@@ -96,7 +97,14 @@ script.txt, CREDITS.txt
 - **Fallback:** if the first query finds nothing, the next one is tried.
 - **No repeats:** the same clip is never used twice in a project.
 - **Speed:** search results are cached, so repeated queries cost no extra requests.
-- **Errors:** a wrong or empty DeepSeek key, or no balance, switches to keyword mode instead of failing the job.
+- **Errors:**
+  - A wrong DeepSeek key or no balance switches to keyword mode instead of failing the job.
+  - If a single batch of 25 sentences fails, only that batch uses keywords.
+- **Splitting:** abbreviations like "Mr.", "Dr." and "U.S." don't break sentences.
+- **"Never use footage with":** whole words only, so "man" doesn't block "woman" or "Manhattan".
+- **4K footage:** 4096×2160 counts as 16:9.
+
+**Troubleshooting:** if the app hits an unexpected error, it shows a popup and writes details to `~/pexels_broll_error.log`. Send that file when reporting a problem.
 
 **Command-line version (no UI)**
 

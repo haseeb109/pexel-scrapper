@@ -110,7 +110,9 @@ def download(job_id):
     job = JOBS.get(job_id) or abort(404)
     if not job.get("result"):
         abort(409)
-    z = Path(job["result"]["zip"])
+    if not job.get("zip"):
+        job["zip"] = sb.make_zip(job["result"]["folder"])      # built on first click, reused after
+    z = Path(job["zip"])
     return send_file(z, as_attachment=True, download_name=z.name)
 
 

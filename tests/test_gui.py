@@ -73,7 +73,12 @@ def main():
             print("   row:", r)
         assert len(rows) == 4 and all(r[4] == "found" for r in rows)
         assert all(str(r[3]).startswith("2/2") for r in rows)
-        assert Path(res["zip"]).exists() and len(list(Path(res["folder"], "clips").glob("*.mp4"))) == 8
+        assert len(list(Path(res["folder"], "clips").glob("*.mp4"))) == 8
+        zpath = Path(out) / "export.zip"
+        sb_zip = gui.sb.make_zip(res["folder"], zpath)
+        import zipfile
+        names = zipfile.ZipFile(sb_zip).namelist()
+        assert sum(n.endswith(".mp4") for n in names) == 8 and any(n.endswith("storyboard.html") for n in names)
         assert gui.load_cfg().get("deepseek_key") == "sk-test", "key remembered"
 
         if len(sys.argv) > 1:
